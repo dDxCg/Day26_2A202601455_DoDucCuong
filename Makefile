@@ -19,6 +19,10 @@ install:
 	# next line died with "No module named pip" on a fresh clone. The stdlib
 	# fallback seeds pip on its own.
 	uv venv --python 3.12 --seed $(VENV) || $(PY) -m venv $(VENV)
+	# Windows venvs put binaries in Scripts/, not bin/, so $(BIN) (hardcoded to
+	# bin/ for the POSIX case) resolves to nothing there. Junction bin -> Scripts
+	# so the rest of this Makefile works unmodified on both platforms.
+	@[ -d $(VENV)/bin ] || [ ! -d $(VENV)/Scripts ] || cmd //c "mklink /J $(VENV)\\bin $(VENV)\\Scripts" >/dev/null
 	$(BIN)/python -m pip install -q --upgrade pip
 	$(BIN)/python -m pip install -q pytest
 	@echo "ready. no api key needed, ever."
