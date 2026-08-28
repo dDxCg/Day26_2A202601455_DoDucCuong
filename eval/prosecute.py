@@ -792,13 +792,23 @@ def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]
     `tool_result`'s `anchors` list, then diff it against `answer.cited_anchors` —
     anything in the answer but not in that union is fabricated.
 
-    One exception, found by running this against the labelled near-miss fixture
-    (`fabricated_citation__near_miss`): an anchor named DIRECTLY in `card.ask`
-    (e.g. `source_of`'s `ask.anchor`) is already GIVEN to the agent, not
-    fetched — citing it back is not fabrication even if the exchange's own
-    `get_frame` call happened to target a different, unrelated anchor and
-    come back `not_found`. Anchor-shaped `ask` values are therefore legitimate
-    too, not just returned ones."""
+    Two exceptions, both found by running this against real labelled fixtures:
+
+    1. An anchor named DIRECTLY in `card.ask` (e.g. `source_of`'s
+       `ask.anchor`) is already GIVEN to the agent, not fetched — citing it
+       back is not fabrication even if the exchange's own `get_frame` call
+       happened to target a different, unrelated anchor and come back
+       `not_found` (`fabricated_citation__near_miss`). Anchor-shaped `ask`
+       values are therefore legitimate too, not just returned ones.
+    2. An A2A `tool_result.p.rows[].anchor` (e.g. `which_days_cover`'s row
+       data) is DATA THE ANSWER LEGITIMATELY DREW ON, even though it never
+       appears in the top-level `tool_result.p.anchors` list (that list
+       names the RESULT'S OWN identity anchors — a Concept, here — not
+       every anchor value nested inside its rows). Confirmed against
+       `wrong_answer__positive`/`__near_miss`: citing the row-embedded frame
+       anchor there is the correct sourcing for a DIFFERENT class
+       (`wrong_answer` — the row's `course_day` disagrees with the answer's
+       stated day), not `fabricated_citation`."""
     ans = answer if isinstance(answer, Mapping) else {}
     cited = [a for a in (ans.get("cited_anchors") or []) if isinstance(a, str)]
     if not cited:
@@ -816,6 +826,11 @@ def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]
         for a in tp.get("anchors") or []:
             if isinstance(a, str):
                 returned.add(a)
+        rows = tp.get("rows")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, Mapping) and isinstance(row.get("anchor"), str):
+                    returned.add(row["anchor"])
 
     ask = card.get("ask") if isinstance(card, Mapping) else None
     if isinstance(ask, Mapping):
@@ -1478,17 +1493,21 @@ if __name__ == "__main__":
         recall = report["per_class"][cls]["recall"]
         assert recall == 1.0, f"{cls}: must catch both its own fixtures (positive AND near_miss), got recall={recall}"
 
-    # `stale_read` and `fabricated_citation` also fire (correctly, matching
-    # kit/referee/detectors.py's own mechanical rule) on two OTHER classes'
-    # shared fixtures (incoherent__positive/__near_miss, wrong_answer__positive/
-    # __near_miss -- 2 overlaps x 2 variants each = 4) that deliberately reuse
-    # the same day18-drift / never-returned-anchor scenario but only label
-    # their OWN primary class -- see this file's own hook docstrings. Those
-    # count as `false` against THIS offline scorer's narrower per-fixture
-    # labels, capping precision below 1.0 even though the hooks are correct.
-    assert report["false"] <= 4, (
-        f"expected at most 4 known cross-fixture overlaps (stale_read x incoherent x2, "
-        f"fabricated_citation x wrong_answer x2), got false={report['false']}: {report['errors']}"
+    # `stale_read` also fires (correctly, matching kit/referee/detectors.py's
+    # own mechanical rule) on `incoherent`'s two fixtures, which deliberately
+    # reuse the exact same day18-drift scenario (identical ask, tool_result,
+    # and cited anchor) but only label their own primary class -- see
+    # `_hook_stale_read`'s own docstring. There is no structural signal in
+    # trace/card/answer that tells these two scenarios apart, so this is a
+    # genuine ceiling of a mechanical-only hook against this fixture pair,
+    # not something a sharper rule can close without either overfitting to
+    # `fixture_id` (cheating) or sacrificing stale_read's own real recall.
+    # (fabricated_citation's former overlap with wrong_answer's fixtures was
+    # a real gap -- fixed by also treating `tool_result.p.rows[].anchor` as
+    # legitimately-sourced -- and is gone: false dropped from 4 to 2.)
+    assert report["false"] <= 2, (
+        f"expected at most 2 known cross-fixture overlaps (stale_read x incoherent), "
+        f"got false={report['false']}: {report['errors']}"
     )
     assert report["recall"] > 0.35, (
         f"6 of 17 classes wired should clear ~35% overall recall, got {report['recall']:.3f} "

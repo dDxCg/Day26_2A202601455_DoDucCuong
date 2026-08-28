@@ -536,22 +536,24 @@ def test_starter_end_to_end_against_the_full_fixture_set(labelled_fixtures):
     `enforcement_failure` (the original starter detector) plus 5 mechanical
     hooks (`stale_read`, `write_violation`, `protocol_misuse`,
     `fabricated_citation`, `authority_exceeded`, `privacy_leak` -- 6 total).
-    `stale_read` and `fabricated_citation` also correctly fire (matching
-    kit/referee/detectors.py's own mechanical rule) on two OTHER classes'
-    shared fixtures (`incoherent__*`, `wrong_answer__*`) that deliberately
-    reuse the same day18-drift / never-returned-anchor scenario but only
-    label their OWN primary class in `label.present_classes` -- see
-    eval/prosecute.py's own hook docstrings. Those 4 count as `false`
-    against this offline scorer's narrower per-fixture labels even though
-    the hooks are correct, so `false` is bounded at 4, not 0."""
+    `stale_read` also correctly fires (matching kit/referee/detectors.py's
+    own mechanical rule) on `incoherent`'s two fixtures, which deliberately
+    reuse the exact same day18-drift scenario but only label their own
+    primary class in `label.present_classes` -- see
+    `eval/prosecute.py`'s `_hook_stale_read` docstring for why this has no
+    structural fix (identical inputs, different labels). Those 2 count as
+    `false` against this offline scorer's narrower per-fixture labels even
+    though the hook is correct, so `false` is bounded at 2, not 0.
+    (`fabricated_citation`'s former overlap with `wrong_answer`'s fixtures
+    was a real gap, since fixed -- it now also treats
+    `tool_result.p.rows[].anchor` as legitimately-sourced.)"""
     report = score_prosecutor(prosecute, labelled_fixtures)
 
     assert report["n_fixtures"] == len(labelled_fixtures)
     assert report["n_errors"] == 0
     assert report["n_timeouts"] == 0
-    assert report["false"] <= 4, (
-        "expected at most 4 known cross-fixture overlaps "
-        f"(stale_read x incoherent x2, fabricated_citation x wrong_answer x2), got {report['false']}"
+    assert report["false"] <= 2, (
+        f"expected at most 2 known cross-fixture overlaps (stale_read x incoherent), got {report['false']}"
     )
     assert report["rejected"] == 0, "must never emit a schema-invalid or over-quota claim on its own"
 
