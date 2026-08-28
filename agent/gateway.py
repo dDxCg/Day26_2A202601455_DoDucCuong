@@ -85,7 +85,9 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -103,6 +105,30 @@ except ImportError:  # pragma: no cover - collaborator file
     ToolCall = Any  # type: ignore[assignment, misc]
     _TOOLCALL_AVAILABLE = False
 
+# kit.mcp.specs is the tool-economy table (base cost, field weights, is_write,
+# needs_lease, deprecation) — same collaborator, same degrade-gracefully rule.
+# Used by JOB 2/3/4 below to answer "is this a write", "does this need a live
+# lease", "roughly what would this cost" without hand-copying that table here.
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost as _spec_cost
+    _SPECS_AVAILABLE = True
+except ImportError:  # pragma: no cover - collaborator file
+    TOOL_SPECS = {}
+    _SPECS_AVAILABLE = False
+    _spec_cost = None
+
+# kit.world.anchor.Anchor is pure parsing (no I/O, CONTRACTS.md 1) — safe to
+# call from inside decide() itself. `Anchor.parse(...).slug` IS the `path_id`
+# for Frame/Deck/Section anchors (kit/world/anchor.py's own path_id() docstring),
+# which is what JOB 1 (ROUTE) needs to look up drift — no `World`/`page()` call
+# (real file I/O) required at all.
+try:
+    from kit.world.anchor import Anchor
+    _ANCHOR_AVAILABLE = True
+except ImportError:  # pragma: no cover - collaborator file
+    Anchor = None  # type: ignore[assignment, misc]
+    _ANCHOR_AVAILABLE = False
+
 # kit.loop.agent is also a collaborator's file, used only by this module's
 # own __main__ demo (to build real Commands the same way the arena's trusted
 # canonicaliser would) — never by decide() itself, which never touches the
@@ -112,6 +138,13 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent.strategy import (
+    BudgetPacer,
+    cheap_mask,
+    is_catalog_trap,
+    pick_replica,
+    successor_of,
+)
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
 __all__ = [
@@ -132,6 +165,72 @@ COMMAND_KINDS: frozenset[str] = frozenset({"mcp", "a2a", "discover"})
 
 # CONTRACTS.md 4.1: `Decision.verdict` — the closed three-member set.
 DECISION_VERDICTS: frozenset[str] = frozenset({"forward", "deny", "rewrite"})
+
+# kit/world/anchor.py NAMESPACES whose slug IS a path_id (the file-identity
+# namespaces — day18-style drift is measured per FILE, not per Talk:/Note:/
+# Concept: anchor). Mirrors kit/referee/detectors.py's own `_PATH_ID_NAMESPACES`.
+_PATH_ID_NAMESPACES: frozenset[str] = frozenset({"Frame", "Deck", "Section"})
+
+# The two write tools kit/mcp/specs.py prices (both `is_write=True` there) —
+# used only as a fallback if TOOL_SPECS itself is unavailable (see the
+# module-level import guard above); when TOOL_SPECS loads, its own `is_write`
+# field is authoritative and this constant is never consulted.
+_FALLBACK_WRITE_TOOLS: frozenset[tuple[str, str]] = frozenset(
+    {("progress", "record_mastery"), ("content", "flag_stale_slide")}
+)
+
+
+def _is_write_tool(server: str, tool: str) -> bool:
+    """CONTRACTS.md's `is_write` flag for `(server, tool)` — JOB 3
+    (AUTHORIZE) only applies to writes. `kit.mcp.specs.TOOL_SPECS` first
+    (authoritative), `_FALLBACK_WRITE_TOOLS` only if that module never
+    imported."""
+    if _SPECS_AVAILABLE:
+        spec = TOOL_SPECS.get((server, tool))
+        if spec is not None:
+            return bool(getattr(spec, "is_write", False))
+        return False
+    return (server, tool) in _FALLBACK_WRITE_TOOLS
+
+
+def _needs_lease(server: str, tool: str) -> bool:
+    """CONTRACTS.md 4.2 mechanic 2: `needs_lease` is reserved for
+    `slides.get_frame`. `TOOL_SPECS` first, else the one tool this is ever
+    true for."""
+    if _SPECS_AVAILABLE:
+        spec = TOOL_SPECS.get((server, tool))
+        if spec is not None:
+            return bool(getattr(spec, "needs_lease", False))
+        return False
+    return (server, tool) == ("slides", "get_frame")
+
+
+def _load_drift_map() -> Mapping[str, Mapping[str, Any]]:
+    """`path_id -> drift.json record` (`{"drifts": bool, ...}`), read ONCE
+    (meant to be called from `Gateway.__init__`, never from `decide()` —
+    RULES.md section 3 only forbids I/O *inside* `decide()`; a one-time read
+    at construction time is the seam this file uses, same reasoning as
+    `agent/strategy.py`'s own module docstring treats `kit.mcp.specs` as
+    static reference data). Globs `kit/world/*/drift.json` the same way
+    `validate_deck.py`'s `resolve_world()` finds the world directory. Reads
+    ONLY `drift.json` (a few KB), never `pages.jsonl` (~12 MB) — this file
+    has no need for the full `World` page index, only the drift table.
+    Degrades to `{}` (nothing known to drift) if no world is present yet,
+    matching every other place in this kit that treats an absent world as
+    'ask your instructor', not a crash. `kit/world/<id>/` is the real
+    exported corpus, never `truth.json` (never shipped to students) — this
+    reads a structural fact (does this path_id's working/canonical replica
+    disagree), never an answer key."""
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = sorted((repo_root / "kit" / "world").glob("*/drift.json"))
+    if not candidates:
+        return {}
+    try:
+        with candidates[-1].open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +449,15 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        # JOB 1 (ROUTE): path_id -> drift.json record, loaded ONCE here (see
+        # `_load_drift_map`'s own docstring for why this is the right seam —
+        # never re-read inside `decide()`).
+        self._drift: Mapping[str, Mapping[str, Any]] = _load_drift_map()
+        # JOB 4 (BUDGET): this Gateway's own running spend, independent of
+        # (and a cross-check against) `ctx.credits` — see
+        # `agent/strategy.py`'s `BudgetPacer` for the arithmetic this exists
+        # to avoid repeating.
+        self._budget_pacer = BudgetPacer(starting_pool=ctx.credits)
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -361,67 +469,126 @@ class Gateway:
         check" against something external looks. Everything you need to
         decide is already sitting in `cmd` and `self.ctx`.
 
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        This baseline implements all four jobs, each deliberately
+        conservative: it only rewrites/denies when it has concrete grounds
+        (a measured drift, a missing lease, a target mismatch, a known
+        catalog-trap mask against a thin budget) — never a reflex check on
+        every call. See agent/README.md's table for why `gateway.py` stays
+        the sole enforcement point (`strategy.py`/`guardrails.py` are
+        libraries it calls into, never parallel enforcement)."""
         self._telemetry.decision_seen(cmd)
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # day18-style drift is real and measured (CORPUS-FACTS.md section 2).
+        # Two cheap, concrete wins, both REWRITES:
+        #   (a) a deprecated tool with a known successor (`slides.search` ->
+        #       `slides.query`) — free, removes a `wasteful` hit outright.
+        #   (b) an anchor whose path_id is KNOWN to drift (`self._drift`) —
+        #       rewrite `mcp-replica` via `agent/strategy.py`'s `pick_replica`.
+        #       Only fires on a CONFIRMED drift, never as a blanket default
+        #       (agent/prompt.md: not a reflex check every round).
+        routed = cmd
+
+        succ = successor_of(routed.server, routed.tool)
+        if succ is not None:
+            routed = self._rebuild(routed, server=succ[0], tool=succ[1])
+
+        if _ANCHOR_AVAILABLE and self._drift:
+            anchor_raw = routed.args.get("anchor") if isinstance(routed.args, dict) else None
+            if isinstance(anchor_raw, str):
+                try:
+                    parsed = Anchor.parse(anchor_raw)
+                except Exception:
+                    parsed = None
+                if parsed is not None and parsed.ns in _PATH_ID_NAMESPACES:
+                    path_id = parsed.slug
+                    record = self._drift.get(path_id) or {}
+                    known_drifting = bool(record.get("drifts", False))
+                    if known_drifting:
+                        choice = pick_replica(path_id=path_id, known_drifting=True)
+                        if routed.headers.get("mcp-replica") != choice.replica:
+                            new_headers = dict(routed.headers)
+                            new_headers["mcp-replica"] = choice.replica
+                            routed = self._rebuild(routed, headers=new_headers)
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # it costs anything? Both checks below are free abstentions
+        # (`verdict="deny"` costs the caller ZERO credits).
+        if _needs_lease(routed.server, routed.tool):
+            if not routed.lease_id or routed.lease_id not in self.ctx.leases:
+                return self.deny(
+                    cmd,
+                    reason=(
+                        f"{routed.server}.{routed.tool} needs a live lease; "
+                        f"lease_id={routed.lease_id!r} is not in ctx.leases={self.ctx.leases!r}"
+                    ),
+                )
+        if cmd.cmd_id in self._denied_cmd_ids:
+            return self.deny(
+                cmd, reason=f"cmd {cmd.cmd_id} was already denied once this duel; nothing has changed"
+            )
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # `authority_exceeded` (CONTRACTS.md section 6.4) — weight 10, tied
+        # heaviest in the rubric. Only applies to writes (`_is_write_tool`);
+        # mirrors kit/referee/detectors.py's own `authority_exceeded`
+        # detector (read, not imported — that module is the referee's own).
+        if _is_write_tool(routed.server, routed.tool):
+            args = routed.args if isinstance(routed.args, dict) else {}
+            target_learner = args.get("learner")
+            if target_learner is None:
+                target_learner = args.get("act")
+            if isinstance(target_learner, str) and target_learner != self.ctx.act:
+                return self.deny(
+                    cmd,
+                    reason=(
+                        f"write {routed.server}.{routed.tool} targets {target_learner!r}, "
+                        f"but this duel serves ctx.act={self.ctx.act!r}"
+                    ),
+                )
+            required_scope = f"wiki.write:{routed.server}"
+            if required_scope not in self.ctx.scopes:
+                return self.deny(
+                    cmd,
+                    reason=(
+                        f"write {routed.server}.{routed.tool} needs scope {required_scope!r}, "
+                        f"not in ctx.scopes={sorted(self.ctx.scopes)!r}"
+                    ),
+                )
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # actually afford `routed` as written? `fields=("*",)`/no mask on a
+        # catalog-trap tool (`registry.list_servers`, `glossary.list_terms`)
+        # is a "punishment button" (FINAL-PLAN.md 4.1) — deny it outright
+        # once the pacer's reserve floor is at risk, rather than guessing a
+        # cheap mask on the model's behalf (this job has no visibility into
+        # what the answer will actually cite, so it can only refuse, never
+        # invent a `cheap_mask`).
+        estimated_cost = 0
+        if _spec_cost is not None:
+            try:
+                estimated_cost = _spec_cost(routed.server, routed.tool, fields=routed.fields, n_rows=1)
+            except KeyError:
+                estimated_cost = 0
+        if is_catalog_trap(routed.server, routed.tool, routed.fields) and not self._budget_pacer.is_affordable(
+            self.ctx.round, estimated_cost
+        ):
+            return self.deny(
+                cmd,
+                reason=(
+                    f"{routed.server}.{routed.tool} is a catalog-trap call (default/full mask) "
+                    f"and would breach the reserve floor at round {self.ctx.round}"
+                ),
+            )
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        verdict = "forward" if routed is cmd else "rewrite"
+        decision = Decision(verdict=verdict, call=call)
+        self._budget_pacer.record_spend(self.ctx.round, estimated_cost)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
@@ -436,6 +603,28 @@ class Gateway:
         decision = Decision(verdict="deny", reason=reason)
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    @staticmethod
+    def _rebuild(cmd: Command, **overrides: Any) -> Command:
+        """`Command` is frozen (CONTRACTS.md 4.1) — JOB 1 (ROUTE) needs to
+        change `server`/`tool`/`headers` on a `rewrite` verdict, so this
+        reconstructs a new `Command` with the given fields overridden,
+        everything else copied verbatim (still going through
+        `Command.__post_init__`'s own validation)."""
+        fields: dict[str, Any] = {
+            "cmd_id": cmd.cmd_id,
+            "kind": cmd.kind,
+            "raw": cmd.raw,
+            "server": cmd.server,
+            "tool": cmd.tool,
+            "args": dict(cmd.args),
+            "fields": cmd.fields,
+            "headers": dict(cmd.headers),
+            "lease_id": cmd.lease_id,
+            "call_index": cmd.call_index,
+        }
+        fields.update(overrides)
+        return Command(**fields)
 
     def _to_tool_call(self, cmd: Command) -> "ToolCall":
         """`Command` -> the `ToolCall` (CONTRACTS.md 3.1) the arena will
@@ -537,7 +726,7 @@ if __name__ == "__main__":
         credits=100,
         round=1,
         call_index=0,
-        leases=(),
+        leases=("lse_7f21",),
         history=(),
     )
     assert isinstance(ctx, GatewayContext), "RecordingGatewayContext must structurally satisfy GatewayContext"
