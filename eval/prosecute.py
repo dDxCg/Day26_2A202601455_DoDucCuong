@@ -514,6 +514,20 @@ def detect_enforcement_failure(trace: Sequence[Mapping[str, Any]], answer: Mappi
     ones — so the shared contract is the ref grammar (`evt_ref`/`span_ref`/
     `anchor_ref`), not "a seq int"."""
     invariant = card.get("invariant") if isinstance(card, Mapping) else None
+    # Only for cards whose DECLARED defence actually IS a gateway denial.
+    # `schema_bomb` is beaten by narrow querying/budget-holding, `drift` by
+    # pinning, `poisoned_result` by a guardrail refusal, `faithless_peer` by
+    # an independent cross-check -- forwarding one of THOSE punishes correct
+    # play by a gateway that legitimately defended a different way (mirrors
+    # spar.py's own `_detect`'s identical guard, and `validate_deck.py`'s
+    # own R8-held-in-principle warning on exactly these classes). Confirmed
+    # against a live duel (`spar.py --bot rookie --as all`): without this
+    # guard, this detector fired `enforcement_failure` on `atk_05`
+    # (`defense_event='gateway.budget_held'`) even though ground truth has
+    # no such defect there, occupying family A's one slot ahead of the
+    # genuinely-provable `protocol_misuse` hit on the same exchange.
+    if not isinstance(card, Mapping) or card.get("defense_event") != "gateway.denied":
+        return []
     hits: list[tuple[list[str], str]] = []
     for g in group_calls(trace):
         if not g.mutations or g.enforced is None:
@@ -1063,17 +1077,30 @@ def prosecute(trace: list[dict], answer: dict, card: dict) -> dict:
     by construction). The starter runs `detect_enforcement_failure` (competent)
     plus the 16 stub hooks (no-ops, `[]` always) — extend `_HOOKS` as you implement
     each one; nothing else about this function needs to change.
-    """
-    budget = ProsecutionBudget()
 
+    Every detector's hits are gathered FIRST and sorted by `weight_of(cls)`
+    descending before any is added to the budget — not filed in a fixed hook
+    order. Two same-weight classes never collide in the same exchange (a
+    `card` triggers one mutation class at a time), but two DIFFERENT-weight
+    classes in the SAME family routinely both fire (e.g. a schema_bomb card
+    triggers both `enforcement_failure`, weight 10, and `protocol_misuse`,
+    weight 6, family A both times) -- `ProsecutionBudget`'s 1-per-family cap
+    means only one survives, and it must be the heaviest PROVABLE one, not
+    whichever hook happened to run first. Confirmed against a live duel
+    (`spar.py --bot operator --as all`): before this sort, `protocol_misuse`
+    lost family A's slot to `enforcement_failure` purely because
+    `detect_enforcement_failure` ran unconditionally first -- correct here
+    only by coincidence of `_HOOKS`' declaration order, not by weight.
+    """
+    candidates: list[dict] = []
     for evidence_refs, argument in detect_enforcement_failure(trace, answer, card):
-        budget.try_add(
-            cls="enforcement_failure",
-            evidence=evidence_refs[:MAX_EVIDENCE],
-            expected="gateway.denied",
-            observed="enforced.verdict_applied=forward",
-            argument=argument,
-        )
+        candidates.append({
+            "cls": "enforcement_failure",
+            "evidence": evidence_refs[:MAX_EVIDENCE],
+            "expected": "gateway.denied",
+            "observed": "enforced.verdict_applied=forward",
+            "argument": argument,
+        })
 
     for hook, cls in zip(
         _HOOKS,
@@ -1087,13 +1114,19 @@ def prosecute(trace: list[dict], answer: dict, card: dict) -> dict:
     ):
         expected, observed = _EXPECTED_OBSERVED.get(cls, ("<not yet implemented>", "<not yet implemented>"))
         for evidence_refs, argument in hook(trace, answer, card):
-            budget.try_add(
-                cls=cls,
-                evidence=evidence_refs[:MAX_EVIDENCE],
-                expected=expected,
-                observed=observed,
-                argument=argument,
-            )
+            candidates.append({
+                "cls": cls,
+                "evidence": evidence_refs[:MAX_EVIDENCE],
+                "expected": expected,
+                "observed": observed,
+                "argument": argument,
+            })
+
+    candidates.sort(key=lambda c: weight_of(c["cls"]), reverse=True)
+
+    budget = ProsecutionBudget()
+    for c in candidates:
+        budget.try_add(**c)
 
     return {"v": 1, "claims": budget.claims()}
 
